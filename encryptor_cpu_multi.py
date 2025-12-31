@@ -1,0 +1,905 @@
+import base64
+import os
+import sys
+import json
+import time
+import threading
+import subprocess
+import concurrent.futures
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
+
+# Проверка и автоматическая установка недостающих модулей
+def check_and_install_packages():
+    required_packages = ['cryptography']
+    
+    for package in required_packages:
+        try:
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            print(f"Установка недостающего пакета: {package}")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+                print(f"Пакет {package} успешно установлен")
+            except Exception as e:
+                print(f"Ошибка установки {package}: {e}")
+                sys.exit(1)
+
+check_and_install_packages()
+
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+
+class ThreadPoolManager:
+    """Менеджер пула потоков для параллельной обработки"""
+    
+    def __init__(self, max_workers: int = None):
+        self.max_workers = max_workers or min(os.cpu_count() or 4, 8)
+        self.executor = None
+        self.futures = []
+    
+    def __enter__(self):
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix='CryptoWorker'
+        )
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.executor:
+            self.executor.shutdown(wait=True)
+    
+    def submit(self, fn, *args, **kwargs):
+        """Добавить задачу в пул"""
+        if not self.executor:
+            raise RuntimeError("ThreadPoolManager не инициализирован")
+        future = self.executor.submit(fn, *args, **kwargs)
+        self.futures.append(future)
+        return future
+    
+    def wait_completion(self, timeout=None):
+        """Ожидать завершения всех задач"""
+        results = []
+        for future in concurrent.futures.as_completed(self.futures, timeout=timeout):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                results.append(e)
+        self.futures.clear()
+        return results
+
+class ParallelEncryptor:
+    """Класс для параллельного шифрования/дешифрования файлов"""
+    
+    BLOCK_SIZE = 1024 * 1024  # 1MB блоки для обработки
+    
+    def __init__(self, console, max_workers=8):
+        self.console = console
+        self.max_workers = max_workers
+        self.processed_blocks = 0
+        self.total_blocks = 0
+        self.lock = threading.Lock()
+    
+    def encrypt_chunk(self, chunk: bytes, session_key: bytes, iv: bytes, chunk_num: int) -> Tuple[int, bytes]:
+        """Шифрование одного блока данных"""
+        try:
+            # Добавляем номер блока к IV для уникальности каждого блока
+            modified_iv = bytes([iv[i] ^ ((chunk_num >> (8 * i)) & 0xFF) for i in range(min(16, len(iv)))])
+            cipher = Cipher(
+                algorithms.AES(session_key),
+                modes.CFB(modified_iv),
+                backend=default_backend()
+            )
+            encryptor = cipher.encryptor()
+            
+            encrypted = encryptor.update(chunk) + encryptor.finalize()
+            
+            with self.lock:
+                self.processed_blocks += 1
+                if self.total_blocks > 0:
+                    progress = int((self.processed_blocks / self.total_blocks) * 100)
+                    self.console.progress_bar(progress, 100, prefix='Многопоточное шифрование:', length=40)
+            
+            return chunk_num, encrypted
+        except Exception as e:
+            return chunk_num, None
+    
+    def decrypt_chunk(self, chunk: bytes, session_key: bytes, iv: bytes, chunk_num: int) -> Tuple[int, bytes]:
+        """Дешифрование одного блока данных"""
+        try:
+            # Восстанавливаем модифицированный IV
+            modified_iv = bytes([iv[i] ^ ((chunk_num >> (8 * i)) & 0xFF) for i in range(min(16, len(iv)))])
+            cipher = Cipher(
+                algorithms.AES(session_key),
+                modes.CFB(modified_iv),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            
+            decrypted = decryptor.update(chunk) + decryptor.finalize()
+            
+            with self.lock:
+                self.processed_blocks += 1
+                if self.total_blocks > 0:
+                    progress = int((self.processed_blocks / self.total_blocks) * 100)
+                    self.console.progress_bar(progress, 100, prefix='Многопоточная расшифровка:', length=40)
+            
+            return chunk_num, decrypted
+        except Exception as e:
+            return chunk_num, None
+    
+    def parallel_encrypt(self, file_data: bytes, session_key: bytes, iv: bytes) -> bytes:
+        """Параллельное шифрование данных"""
+        chunk_size = self.BLOCK_SIZE
+        chunks = [file_data[i:i + chunk_size] for i in range(0, len(file_data), chunk_size)]
+        
+        self.processed_blocks = 0
+        self.total_blocks = len(chunks)
+        
+        encrypted_chunks = [None] * len(chunks)
+        
+        with ThreadPoolManager(max_workers=self.max_workers) as pool:
+            # Запускаем задачи на шифрование каждого блока
+            futures = []
+            for i, chunk in enumerate(chunks):
+                future = pool.submit(self.encrypt_chunk, chunk, session_key, iv, i)
+                futures.append(future)
+            
+            # Собираем результаты в правильном порядке
+            for future in concurrent.futures.as_completed(futures):
+                chunk_num, encrypted = future.result()
+                if encrypted is not None:
+                    encrypted_chunks[chunk_num] = encrypted
+        
+        # Объединяем все зашифрованные блоки
+        return b''.join(encrypted_chunks)
+    
+    def parallel_decrypt(self, encrypted_data: bytes, session_key: bytes, iv: bytes) -> bytes:
+        """Параллельная расшифровка данных"""
+        chunk_size = self.BLOCK_SIZE
+        chunks = [encrypted_data[i:i + chunk_size] for i in range(0, len(encrypted_data), chunk_size)]
+        
+        self.processed_blocks = 0
+        self.total_blocks = len(chunks)
+        
+        decrypted_chunks = [None] * len(chunks)
+        
+        with ThreadPoolManager(max_workers=self.max_workers) as pool:
+            # Запускаем задачи на дешифрование каждого блока
+            futures = []
+            for i, chunk in enumerate(chunks):
+                future = pool.submit(self.decrypt_chunk, chunk, session_key, iv, i)
+                futures.append(future)
+            
+            # Собираем результаты в правильном порядке
+            for future in concurrent.futures.as_completed(futures):
+                chunk_num, decrypted = future.result()
+                if decrypted is not None:
+                    decrypted_chunks[chunk_num] = decrypted
+        
+        # Объединяем все расшифрованные блоки
+        return b''.join(decrypted_chunks)
+
+class ConsoleManager:
+    """Класс для управления выводом в консоль с динамическим обновлением"""
+    
+    @staticmethod
+    def clear_lines(num_lines: int = 1):
+        """Очистить указанное количество строк"""
+        for _ in range(num_lines):
+            sys.stdout.write('\033[F')  # Переместить курсор вверх
+            sys.stdout.write('\033[K')  # Очистить строку
+    
+    @staticmethod
+    def print_header():
+        """Вывести заголовок программы"""
+        os.system('cls' if os.name == 'nt' else 'clear')
+        print("=" * 60)
+    
+    @staticmethod
+    def show_spinner(delay: float = 0.1):
+        """Показать анимированный спиннер"""
+        spinner = ['|', '/', '-', '\\']
+        idx = 0
+        while getattr(threading.current_thread(), "do_run", True):
+            sys.stdout.write(f"\r[{spinner[idx % len(spinner)]}] Обработка...")
+            sys.stdout.flush()
+            idx += 1
+            time.sleep(delay)
+        sys.stdout.write('\r' + ' ' * 30 + '\r')
+    
+    @staticmethod
+    def progress_bar(iteration: int, total: int, prefix: str = '', length: int = 50):
+        """Показать прогресс бар"""
+        percent = ("{0:.1f}").format(100 * (iteration / float(total)))
+        filled_length = int(length * iteration // total)
+        bar = '█' * filled_length + '░' * (length - filled_length)
+        sys.stdout.write(f'\r{prefix} |{bar}| {percent}%')
+        if iteration == total:
+            sys.stdout.write('\n')
+        sys.stdout.flush()
+
+class SessionManager:
+    """Менеджер для сохранения и загрузки сессий"""
+    
+    @staticmethod
+    def export_session(private_key_pem: str, public_key_pem: str, 
+                       other_public_key_pem: Optional[str], key_size: int, 
+                       max_workers: int) -> str:
+        """Экспорт сессии в JSON файл"""
+        session_data = {
+            "timestamp": datetime.now().isoformat(),
+            "key_size": key_size,
+            "private_key": private_key_pem,
+            "public_key": public_key_pem,
+            "other_public_key": other_public_key_pem,
+            "session_id": os.urandom(16).hex(),
+            "max_workers": max_workers
+        }
+        
+        filename = f"session_{int(time.time())}.json"
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(session_data, f, indent=2)
+        
+        return filename
+    
+    @staticmethod
+    def import_session(filename: str) -> Optional[Dict[str, Any]]:
+        """Импорт сессии из JSON файла"""
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                session_data = json.load(f)
+            
+            # Проверка целостности данных
+            required_keys = ['private_key', 'public_key', 'key_size']
+            if all(key in session_data for key in required_keys):
+                return session_data
+            else:
+                return None
+        except Exception:
+            return None
+    
+    @staticmethod
+    def find_latest_session() -> Optional[str]:
+        """Найти последнюю сессию"""
+        session_files = sorted(Path('.').glob('session_*.json'), 
+                             key=lambda x: x.stat().st_mtime, 
+                             reverse=True)
+        return str(session_files[0]) if session_files else None
+
+class SecureMessagingApp:
+    def __init__(self):
+        self.key_size = 4096
+        self.private_key = None
+        self.public_key = None
+        self.other_public_key = None
+        self.session_key = None
+        self.session_loaded = False
+        self.max_workers = min(os.cpu_count() or 4, 8)  # По умолчанию используем до 8 потоков
+        self.use_multithreading = True
+        self.parallel_encryptor = None
+        self.console = ConsoleManager()
+        self.session_manager = SessionManager()
+        
+        # Автоматическая инициализация
+        self.initialize()
+    
+    def initialize(self):
+        self.console.print_header()
+        print("Инициализация системы...")
+        self.parallel_encryptor = ParallelEncryptor(self.console, self.max_workers)
+        latest_session = self.session_manager.find_latest_session()
+        if latest_session:
+            print(f"Найдена сессия: {latest_session}")
+            choice = input("Загрузить сессию? (Y/n): ").strip().lower()
+            if choice in ['', 'y', 'yes', 'да']:
+                self.load_session(latest_session)
+                return
+        self.console.clear_lines(2)
+        print("1. Сгенерировать новые ключи")
+        print("2. Импортировать сессию из файла")
+        print("3. Восстановить сессию из ключей")
+        
+        while True:
+            choice = input("\nВыберите действие (1-3): ").strip()
+            
+            if choice == '1':
+                self.generate_keys()
+                break
+            elif choice == '2':
+                filename = input("Введите имя файла сессии: ").strip()
+                self.load_session(filename)
+                break
+            elif choice == '3':
+                self.recover_from_keys()
+                break
+            else:
+                print("Неверный выбор. Попробуйте снова.")
+    
+    def load_session(self, filename: str):
+        """Загрузка сессии из файла"""
+        spinner_thread = threading.Thread(target=self.console.show_spinner)
+        spinner_thread.start()
+        
+        try:
+            session_data = self.session_manager.import_session(filename)
+            
+            if session_data:
+                self.key_size = session_data['key_size']
+                
+                # Загрузка количества потоков из сессии
+                if 'max_workers' in session_data:
+                    self.max_workers = session_data['max_workers']
+                    self.parallel_encryptor = ParallelEncryptor(self.console, self.max_workers)
+                
+                # Загрузка приватного ключа
+                self.private_key = serialization.load_pem_private_key(
+                    session_data['private_key'].encode('utf-8'),
+                    password=None,
+                    backend=default_backend()
+                )
+                
+                # Загрузка публичного ключа
+                self.public_key = self.private_key.public_key()
+                
+                # Загрузка публичного ключа собеседника
+                if session_data['other_public_key']:
+                    self.other_public_key = serialization.load_pem_public_key(
+                        session_data['other_public_key'].encode('utf-8'),
+                        backend=default_backend()
+                    )
+                
+                spinner_thread.do_run = False
+                spinner_thread.join()
+                
+                print(f"\rСессия успешно загружена из {filename}")
+                self.session_loaded = True
+                return True
+            else:
+                raise ValueError("Неверный формат сессии")
+                
+        except Exception as e:
+            spinner_thread.do_run = False
+            spinner_thread.join()
+            print(f"\rОшибка загрузки сессии: {e}")
+            return False
+    
+    def save_session_auto(self):
+        """Автоматическое сохранение сессии после получения ключа собеседника"""
+        if self.private_key and self.public_key:
+            try:
+                # Экспорт ключей в PEM формат
+                private_key_pem = self.private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                ).decode('utf-8')
+                
+                public_key_pem = self.public_key.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                ).decode('utf-8')
+                
+                other_public_key_pem = None
+                if self.other_public_key:
+                    other_public_key_pem = self.other_public_key.public_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PublicFormat.SubjectPublicKeyInfo
+                    ).decode('utf-8')
+                
+                # Экспорт сессии
+                filename = self.session_manager.export_session(
+                    private_key_pem, public_key_pem, other_public_key_pem, 
+                    self.key_size, self.max_workers
+                )
+                
+                print(f"Сессия автоматически сохранена в {filename}")
+                return filename
+                
+            except Exception as e:
+                print(f"Ошибка сохранения сессии: {e}")
+                return None
+    
+    def recover_from_keys(self):
+        """Восстановление сессии из ключей"""
+        print("\nВосстановление сессии из ключей:")
+        
+        # Запрос приватного ключа
+        print("Введите ваш приватный ключ (PEM формат):")
+        print("Введите 'END' на новой строке для завершения")
+        private_lines = []
+        while True:
+            line = input()
+            if line.strip().upper() == 'END':
+                break
+            private_lines.append(line)
+        
+        # Запрос публичного ключа собеседника (опционально)
+        print("\nВведите публичный ключ собеседника (если есть):")
+        print("Введите 'END' на новой строке для завершения или 'SKIP' для пропуска")
+        public_lines = []
+        while True:
+            line = input()
+            if line.strip().upper() in ['END', 'SKIP']:
+                break
+            public_lines.append(line)
+        
+        try:
+            # Загрузка приватного ключа
+            self.private_key = serialization.load_pem_private_key(
+                '\n'.join(private_lines).encode('utf-8'),
+                password=None,
+                backend=default_backend()
+            )
+            self.public_key = self.private_key.public_key()
+            
+            # Загрузка публичного ключа собеседника
+            if public_lines and public_lines[0].upper() != 'SKIP':
+                self.other_public_key = serialization.load_pem_public_key(
+                    '\n'.join(public_lines).encode('utf-8'),
+                    backend=default_backend()
+                )
+            
+            print("Сессия восстановлена успешно!")
+            self.save_session_auto()
+            
+        except Exception as e:
+            print(f"Ошибка восстановления сессии: {e}")
+    
+    def generate_keys(self):
+        """Генерация новой пары ключей"""
+        print(f"\nГенерация ключей RSA-{self.key_size}...")
+        
+        # Показать прогресс бар
+        for i in range(101):
+            self.console.progress_bar(i, 100, prefix='Генерация ключей:', length=40)
+            time.sleep(0.02)  # Имитация работы
+        
+        self.private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=self.key_size,
+            backend=default_backend()
+        )
+        self.public_key = self.private_key.public_key()
+        
+        print("\nКлючи успешно сгенерированы!")
+    
+    def show_public_key(self):
+        """Показать публичный ключ"""
+        if not self.public_key:
+            print("Сначала сгенерируйте ключи!")
+            return
+        
+        pem = self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode('utf-8')
+        
+        self.console.print_header()
+        print("ВАШ ПУБЛИЧНЫЙ КЛЮЧ:\n")
+        print(pem)
+        print("\n" + "=" * 60)
+        input("\nНажмите Enter для продолжения...")
+    
+    def import_public_key(self):
+        """Импорт публичного ключа собеседника"""
+        print("Вставьте публичный ключ собеседника ниже:")
+        print("Введите 'END' на новой строке для завершения")
+        
+        lines = []
+        while True:
+            line = input()
+            if line.strip().upper() == 'END':
+                break
+            lines.append(line)
+        
+        try:
+            self.other_public_key = serialization.load_pem_public_key(
+                '\n'.join(lines).encode('utf-8'),
+                backend=default_backend()
+            )
+            print("Публичный ключ успешно импортирован!")
+            
+            # Автоматическое сохранение сессии
+            self.save_session_auto()
+            
+            return True
+        except Exception as e:
+            print(f"Ошибка импорта ключа: {e}")
+            return False
+    
+    def encrypt_message(self):
+        """Шифрование сообщения"""
+        if not self.other_public_key:
+            print("Сначала импортируйте публичный ключ собеседника!")
+            return
+        
+        message = input("\nВведите сообщение для шифрования: ")
+        
+        if not message:
+            print("Сообщение не может быть пустым!")
+            return
+        
+        try:
+            print("Шифрование...")
+            self.session_key = os.urandom(32)
+            
+            # Показать прогресс
+            for i in range(101):
+                self.console.progress_bar(i, 100, prefix='Шифрование:', length=40)
+                time.sleep(0.01)
+            
+            encrypted_key = self.other_public_key.encrypt(
+                self.session_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            
+            iv = os.urandom(16)
+            cipher = Cipher(
+                algorithms.AES(self.session_key),
+                modes.CFB(iv),
+                backend=default_backend()
+            )
+            encryptor = cipher.encryptor()
+            encrypted_message = encryptor.update(message.encode()) + encryptor.finalize()
+            
+            result = base64.b64encode(
+                len(encrypted_key).to_bytes(4, 'big') + 
+                encrypted_key + 
+                iv + 
+                encrypted_message
+            ).decode()
+            
+            self.console.print_header()
+            print("ЗАШИФРОВАННОЕ СООБЩЕНИЕ:\n")
+            print(result)
+            print("\n" + "=" * 60)
+            input("\nНажмите Enter для продолжения...")
+            
+        except Exception as e:
+            print(f"Ошибка шифрования: {e}")
+    
+    def decrypt_message(self):
+        """Расшифровка сообщения"""
+        if not self.private_key:
+            print("Сначала сгенерируйте ключи!")
+            return
+        
+        print("Вставьте зашифрованное сообщение:")
+        print("Введите 'END' на новой строке для завершения")
+        
+        lines = []
+        while True:
+            line = input()
+            if line.strip().upper() == 'END':
+                break
+            lines.append(line)
+        
+        encrypted = '\n'.join(lines)
+        
+        try:
+            print("Расшифровка...")
+            
+            # Показать прогресс
+            for i in range(101):
+                self.console.progress_bar(i, 100, prefix='Расшифровка:', length=40)
+                time.sleep(0.01)
+            
+            data = base64.b64decode(encrypted)
+            key_len = int.from_bytes(data[:4], 'big')
+            encrypted_key = data[4:4+key_len]
+            iv = data[4+key_len:4+key_len+16]
+            encrypted_message = data[4+key_len+16:]
+            
+            session_key = self.private_key.decrypt(
+                encrypted_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            
+            cipher = Cipher(
+                algorithms.AES(session_key),
+                modes.CFB(iv),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            message = decryptor.update(encrypted_message) + decryptor.finalize()
+            
+            self.console.print_header()
+            print("РАСШИФРОВАННОЕ СООБЩЕНИЕ:\n")
+            print(message.decode())
+            print("\n" + "=" * 60)
+            input("\nНажмите Enter для продолжения...")
+            
+        except Exception as e:
+            print(f"Ошибка расшифровки: {e}")
+    
+    def encrypt_file(self):
+        """Шифрование файла"""
+        if not self.other_public_key:
+            print("Сначала импортируйте публичный ключ собеседника!")
+            return
+        
+        file_path = input("\nВведите путь к файлу: ").strip()
+        
+        if not os.path.exists(file_path):
+            print("Файл не найден!")
+            return
+        
+        try:
+            print(f"Шифрование файла: {file_path}")
+            
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+            
+            file_size = len(file_data)
+            
+            # Спросить о использовании многопоточности для больших файлов
+            use_multithreading = self.use_multithreading
+            if file_size > 5 * 1024 * 1024:  # > 5MB
+                print(f"Размер файла: {file_size / (1024*1024):.2f} MB")
+                print(f"Доступно потоков: {self.max_workers}")
+                choice = input("Использовать многопоточное шифрование? (Y/n): ").strip().lower()
+                use_multithreading = choice in ['', 'y', 'yes', 'да']
+            
+            session_key = os.urandom(32)
+            encrypted_key = self.other_public_key.encrypt(
+                session_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            
+            iv = os.urandom(16)
+            
+            if use_multithreading and file_size > self.parallel_encryptor.BLOCK_SIZE:
+                print(f"Используется многопоточное шифрование ({self.max_workers} потоков)...")
+                encrypted_data = self.parallel_encryptor.parallel_encrypt(file_data, session_key, iv)
+            else:
+                # Обычное однопоточное шифрование
+                print("Используется однопоточное шифрование...")
+                cipher = Cipher(
+                    algorithms.AES(session_key),
+                    modes.CFB(iv),
+                    backend=default_backend()
+                )
+                encryptor = cipher.encryptor()
+                
+                # Показать прогресс для однопоточного режима
+                chunk_size = 64 * 1024  # 64KB
+                encrypted_chunks = []
+                for i in range(0, file_size, chunk_size):
+                    chunk = file_data[i:i + chunk_size]
+                    encrypted_chunks.append(encryptor.update(chunk))
+                    progress = min(i + chunk_size, file_size)
+                    self.console.progress_bar(progress, file_size, prefix='Шифрование файла:', length=40)
+                
+                encrypted_chunks.append(encryptor.finalize())
+                encrypted_data = b''.join(encrypted_chunks)
+                self.console.progress_bar(file_size, file_size, prefix='Шифрование файла:', length=40)
+            
+            output_path = file_path + ".enc"
+            with open(output_path, 'wb') as f:
+                f.write(len(encrypted_key).to_bytes(4, 'big'))
+                f.write(encrypted_key)
+                f.write(iv)
+                f.write(encrypted_data)
+            
+            print(f"\nФайл успешно зашифрован: {output_path}")
+            
+        except Exception as e:
+            print(f"Ошибка шифрования файла: {e}")
+    
+    def decrypt_file(self):
+        """Расшифровка файла"""
+        if not self.private_key:
+            print("Сначала сгенерируйте ключи!")
+            return
+        
+        file_path = input("\nВведите путь к зашифрованному файлу: ").strip()
+        
+        if not os.path.exists(file_path):
+            print("Файл не найден!")
+            return
+        try:
+            print(f"Расшифровка файла: {file_path}")
+            with open(file_path, 'rb') as f: data = f.read()  
+            file_size = len(data)
+            key_len = int.from_bytes(data[:4], 'big')
+            encrypted_key = data[4:4+key_len]
+            iv = data[4+key_len:4+key_len+16]
+            encrypted_data = data[4+key_len+16:] 
+            session_key = self.private_key.decrypt(encrypted_key, padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+            
+            use_multithreading = self.use_multithreading
+            if len(encrypted_data) > 5 * 1024 * 1024:
+                print(f"Размер зашифрованных данных: {len(encrypted_data) / (1024*1024):.2f} MB")
+                print(f"Доступно потоков: {self.max_workers}")
+                choice = input("Использовать многопоточную расшифровку? (Y/n): ").strip().lower()
+                use_multithreading = choice in ['', 'y', 'yes', 'да']
+            
+            if use_multithreading and len(encrypted_data) > self.parallel_encryptor.BLOCK_SIZE:
+                print(f"Используется многопоточная расшифровка ({self.max_workers} потоков)...")
+                decrypted_data = self.parallel_encryptor.parallel_decrypt(encrypted_data, session_key, iv)
+            else:
+                print("Используется однопоточная расшифровка...")
+                cipher = Cipher(
+                    algorithms.AES(session_key),
+                    modes.CFB(iv),
+                    backend=default_backend()
+                )
+                decryptor = cipher.decryptor() 
+                chunk_size = 64 * 1024 
+                data_size = len(encrypted_data)
+                decrypted_chunks = []
+                for i in range(0, data_size, chunk_size):
+                    chunk = encrypted_data[i:i + chunk_size]
+                    decrypted_chunks.append(decryptor.update(chunk))
+                    progress = min(i + chunk_size, data_size)
+                    self.console.progress_bar(progress, data_size, prefix='Расшифровка файла:', length=40)
+                
+                decrypted_chunks.append(decryptor.finalize())
+                decrypted_data = b''.join(decrypted_chunks)
+                self.console.progress_bar(data_size, data_size, prefix='Расшифровка файла:', length=40)
+            
+            if file_path.endswith('.enc'): output_path = file_path[:-4] + '.decrypted'
+            else: output_path = file_path + '.decrypted'
+            with open(output_path, 'wb') as f: f.write(decrypted_data)
+            print(f"\nФайл успешно расшифрован: {output_path}")
+            
+        except Exception as e: print(f"Ошибка расшифровки файла: {e}")
+    
+    def change_key_size(self):
+        print(f"\nТекущий размер ключа: {self.key_size} бит")
+        print("Доступные размеры: 4096, 8192")
+        
+        while True:
+            try:
+                new_size = int(input("Введите новый размер ключа: ").strip())
+                if new_size in [4096, 8192]:
+                    self.key_size = new_size
+                    print(f"Размер ключа изменен на {new_size} бит")
+                    print("Не забудьте сгенерировать новые ключи!")
+                    break
+                else: print("Доступны только размеры 4096 или 8192 бит!")
+            except ValueError: print("Введите число (4096 или 8192)!")
+    
+    def change_thread_count(self):
+        max_possible = os.cpu_count() or 16
+        print(f"\nТекущее количество потоков: {self.max_workers}")
+        print(f"Доступно ядер/потоков в системе: {max_possible}")
+        print(f"Рекомендуется: от 2 до {min(16, max_possible)} потоков")
+        
+        while True:
+            try:
+                new_count = int(input(f"Введите новое количество потоков (1-{max_possible}): ").strip())
+                if 1 <= new_count <= max_possible:
+                    self.max_workers = new_count
+                    self.parallel_encryptor = ParallelEncryptor(self.console, self.max_workers)
+                    print(f"Количество потоков изменено на {new_count}")
+                    if self.private_key: self.save_session_auto()     
+                    break
+                else: print(f"Введите число от 1 до {max_possible}!")
+            except ValueError: print("Введите число!")
+    
+    def toggle_multithreading(self):
+        """Включение/выключение многопоточности"""
+        self.use_multithreading = not self.use_multithreading
+        status = "ВКЛЮЧЕНА" if self.use_multithreading else "ВЫКЛЮЧЕНА"
+        print(f"\nМногопоточность {status}")
+        print(f"Используется потоков: {self.max_workers if self.use_multithreading else 1}")
+        time.sleep(1)
+    
+    def show_status(self):
+        self.console.print_header()
+        print("СТАТУС СЕССИИ:")
+        print("=" * 60)
+        
+        # Информация о ключах
+        key_status = "СГЕНЕРИРОВАНЫ" if self.private_key else "ОТСУТСТВУЮТ"
+        print(f"Ваши ключи: {key_status}")    
+        if self.private_key: print(f"Размер ключа: {self.key_size} бит")
+        other_key_status = "ИМПОРТИРОВАН" if self.other_public_key else "ОТСУТСТВУЕТ"
+        print(f"Ключ собеседника: {other_key_status}")
+        
+        # Информация о многопоточности
+        threading_status = "ВКЛЮЧЕНА" if self.use_multithreading else "ВЫКЛЮЧЕНА"
+        print(f"Многопоточность: {threading_status}")
+        print(f"Количество потоков: {self.max_workers}")
+        print(f"Доступно ядер CPU: {os.cpu_count() or 'N/A'}")
+        
+        # Информация о сессиях
+        latest_session = self.session_manager.find_latest_session()
+        if latest_session:
+            session_time = datetime.fromtimestamp(os.path.getmtime(latest_session))
+            print(f"Последняя сессия: {session_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        print("=" * 60)
+        input("\nНажмите Enter для продолжения...")
+    
+    def main_menu(self):
+        while True:
+            self.console.print_header()
+            if self.private_key:
+                print("[✓] Ваши ключи готовы")
+            else:
+                print("[!] Ключи не сгенерированы")
+            
+            if self.other_public_key:
+                print("[✓] Ключ собеседника загружен")
+            else:
+                print("[!] Ключ собеседника отсутствует")
+            
+            threading_status = "✓ ВКЛ" if self.use_multithreading else "✗ ВЫКЛ"
+            print(f"[{threading_status}] Многопоточность ({self.max_workers} потоков)")
+            
+            print("=" * 60)
+            print("1. Сгенерировать новые ключи")
+            print("2. Показать мой публичный ключ")
+            print("3. Импортировать ключ собеседника")
+            print("4. Зашифровать сообщение")
+            print("5. Расшифровать сообщение")
+            print("6. Зашифровать файл")
+            print("7. Расшифровать файл")
+            print(f"8. Изменить размер ключа (сейчас: {self.key_size})")
+            print(f"9. Изменить количество потоков (сейчас: {self.max_workers})")
+            print(f"10. Вкл/Выкл многопоточность (сейчас: {'ВКЛ' if self.use_multithreading else 'ВЫКЛ'})")
+            print("11. Показать статус сессии")
+            print("0. Выход")
+            print("=" * 60)
+            
+            choice = input("\nВыберите действие (0-11): ").strip()
+            
+            if choice == '1':
+                self.generate_keys()
+            elif choice == '2':
+                self.show_public_key()
+            elif choice == '3':
+                self.import_public_key()
+            elif choice == '4':
+                self.encrypt_message()
+            elif choice == '5':
+                self.decrypt_message()
+            elif choice == '6':
+                self.encrypt_file()
+            elif choice == '7':
+                self.decrypt_file()
+            elif choice == '8':
+                self.change_key_size()
+            elif choice == '9':
+                self.change_thread_count()
+            elif choice == '10':
+                self.toggle_multithreading()
+            elif choice == '11':
+                self.show_status()
+            elif choice == '0':
+                print("\nЗавершение работы...")
+                print("Все ключи удалены из памяти.")
+                break
+            else:
+                print("Неверный выбор!")
+                time.sleep(1)
+
+def main():
+    try:
+        app = SecureMessagingApp()
+        app.main_menu()
+    except KeyboardInterrupt:
+        print("\n\nПрограмма прервана.")
+    except Exception as e:
+        print(f"\nКритическая ошибка: {e}")
+        input("Нажмите Enter для выхода...")
+
+main()
