@@ -10,7 +10,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
-# Проверка и автоматическая установка недостающих модулей
 def check_and_install_packages():
     required_packages = ['cryptography']
     
@@ -34,8 +33,6 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
 class ThreadPoolManager:
-    """Менеджер пула потоков для параллельной обработки"""
-    
     def __init__(self, max_workers: int = None):
         self.max_workers = max_workers or min(os.cpu_count() or 4, 8)
         self.executor = None
@@ -53,7 +50,6 @@ class ThreadPoolManager:
             self.executor.shutdown(wait=True)
     
     def submit(self, fn, *args, **kwargs):
-        """Добавить задачу в пул"""
         if not self.executor:
             raise RuntimeError("ThreadPoolManager не инициализирован")
         future = self.executor.submit(fn, *args, **kwargs)
@@ -61,7 +57,6 @@ class ThreadPoolManager:
         return future
     
     def wait_completion(self, timeout=None):
-        """Ожидать завершения всех задач"""
         results = []
         for future in concurrent.futures.as_completed(self.futures, timeout=timeout):
             try:
@@ -72,10 +67,7 @@ class ThreadPoolManager:
         return results
 
 class ParallelEncryptor:
-    """Класс для параллельного шифрования/дешифрования файлов"""
-    
-    BLOCK_SIZE = 1024 * 1024  # 1MB блоки для обработки
-    
+    BLOCK_SIZE = 1024 * 1024 
     def __init__(self, console, max_workers=8):
         self.console = console
         self.max_workers = max_workers
@@ -84,9 +76,7 @@ class ParallelEncryptor:
         self.lock = threading.Lock()
     
     def encrypt_chunk(self, chunk: bytes, session_key: bytes, iv: bytes, chunk_num: int) -> Tuple[int, bytes]:
-        """Шифрование одного блока данных"""
         try:
-            # Добавляем номер блока к IV для уникальности каждого блока
             modified_iv = bytes([iv[i] ^ ((chunk_num >> (8 * i)) & 0xFF) for i in range(min(16, len(iv)))])
             cipher = Cipher(
                 algorithms.AES(session_key),
@@ -94,7 +84,6 @@ class ParallelEncryptor:
                 backend=default_backend()
             )
             encryptor = cipher.encryptor()
-            
             encrypted = encryptor.update(chunk) + encryptor.finalize()
             
             with self.lock:
@@ -108,9 +97,7 @@ class ParallelEncryptor:
             return chunk_num, None
     
     def decrypt_chunk(self, chunk: bytes, session_key: bytes, iv: bytes, chunk_num: int) -> Tuple[int, bytes]:
-        """Дешифрование одного блока данных"""
         try:
-            # Восстанавливаем модифицированный IV
             modified_iv = bytes([iv[i] ^ ((chunk_num >> (8 * i)) & 0xFF) for i in range(min(16, len(iv)))])
             cipher = Cipher(
                 algorithms.AES(session_key),
@@ -132,7 +119,6 @@ class ParallelEncryptor:
             return chunk_num, None
     
     def parallel_encrypt(self, file_data: bytes, session_key: bytes, iv: bytes) -> bytes:
-        """Параллельное шифрование данных"""
         chunk_size = self.BLOCK_SIZE
         chunks = [file_data[i:i + chunk_size] for i in range(0, len(file_data), chunk_size)]
         
@@ -142,23 +128,18 @@ class ParallelEncryptor:
         encrypted_chunks = [None] * len(chunks)
         
         with ThreadPoolManager(max_workers=self.max_workers) as pool:
-            # Запускаем задачи на шифрование каждого блока
             futures = []
             for i, chunk in enumerate(chunks):
                 future = pool.submit(self.encrypt_chunk, chunk, session_key, iv, i)
                 futures.append(future)
-            
-            # Собираем результаты в правильном порядке
             for future in concurrent.futures.as_completed(futures):
                 chunk_num, encrypted = future.result()
                 if encrypted is not None:
                     encrypted_chunks[chunk_num] = encrypted
         
-        # Объединяем все зашифрованные блоки
         return b''.join(encrypted_chunks)
     
     def parallel_decrypt(self, encrypted_data: bytes, session_key: bytes, iv: bytes) -> bytes:
-        """Параллельная расшифровка данных"""
         chunk_size = self.BLOCK_SIZE
         chunks = [encrypted_data[i:i + chunk_size] for i in range(0, len(encrypted_data), chunk_size)]
         
@@ -168,30 +149,25 @@ class ParallelEncryptor:
         decrypted_chunks = [None] * len(chunks)
         
         with ThreadPoolManager(max_workers=self.max_workers) as pool:
-            # Запускаем задачи на дешифрование каждого блока
             futures = []
             for i, chunk in enumerate(chunks):
                 future = pool.submit(self.decrypt_chunk, chunk, session_key, iv, i)
                 futures.append(future)
             
-            # Собираем результаты в правильном порядке
             for future in concurrent.futures.as_completed(futures):
                 chunk_num, decrypted = future.result()
                 if decrypted is not None:
                     decrypted_chunks[chunk_num] = decrypted
         
-        # Объединяем все расшифрованные блоки
         return b''.join(decrypted_chunks)
 
 class ConsoleManager:
-    """Класс для управления выводом в консоль с динамическим обновлением"""
     
     @staticmethod
     def clear_lines(num_lines: int = 1):
-        """Очистить указанное количество строк"""
         for _ in range(num_lines):
-            sys.stdout.write('\033[F')  # Переместить курсор вверх
-            sys.stdout.write('\033[K')  # Очистить строку
+            sys.stdout.write('\033[F') 
+            sys.stdout.write('\033[K') 
     
     @staticmethod
     def print_header():
@@ -201,7 +177,6 @@ class ConsoleManager:
     
     @staticmethod
     def show_spinner(delay: float = 0.1):
-        """Показать анимированный спиннер"""
         spinner = ['|', '/', '-', '\\']
         idx = 0
         while getattr(threading.current_thread(), "do_run", True):
@@ -213,7 +188,6 @@ class ConsoleManager:
     
     @staticmethod
     def progress_bar(iteration: int, total: int, prefix: str = '', length: int = 50):
-        """Показать прогресс бар"""
         percent = ("{0:.1f}").format(100 * (iteration / float(total)))
         filled_length = int(length * iteration // total)
         bar = '█' * filled_length + '░' * (length - filled_length)
@@ -223,13 +197,11 @@ class ConsoleManager:
         sys.stdout.flush()
 
 class SessionManager:
-    """Менеджер для сохранения и загрузки сессий"""
     
     @staticmethod
     def export_session(private_key_pem: str, public_key_pem: str, 
                        other_public_key_pem: Optional[str], key_size: int, 
                        max_workers: int) -> str:
-        """Экспорт сессии в JSON файл"""
         session_data = {
             "timestamp": datetime.now().isoformat(),
             "key_size": key_size,
@@ -248,12 +220,10 @@ class SessionManager:
     
     @staticmethod
     def import_session(filename: str) -> Optional[Dict[str, Any]]:
-        """Импорт сессии из JSON файла"""
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 session_data = json.load(f)
             
-            # Проверка целостности данных
             required_keys = ['private_key', 'public_key', 'key_size']
             if all(key in session_data for key in required_keys):
                 return session_data
@@ -264,7 +234,6 @@ class SessionManager:
     
     @staticmethod
     def find_latest_session() -> Optional[str]:
-        """Найти последнюю сессию"""
         session_files = sorted(Path('.').glob('session_*.json'), 
                              key=lambda x: x.stat().st_mtime, 
                              reverse=True)
@@ -278,13 +247,11 @@ class SecureMessagingApp:
         self.other_public_key = None
         self.session_key = None
         self.session_loaded = False
-        self.max_workers = min(os.cpu_count() or 4, 8)  # По умолчанию используем до 8 потоков
+        self.max_workers = min(os.cpu_count() or 4, 8) 
         self.use_multithreading = True
         self.parallel_encryptor = None
         self.console = ConsoleManager()
         self.session_manager = SessionManager()
-        
-        # Автоматическая инициализация
         self.initialize()
     
     def initialize(self):
@@ -320,7 +287,6 @@ class SecureMessagingApp:
                 print("Неверный выбор. Попробуйте снова.")
     
     def load_session(self, filename: str):
-        """Загрузка сессии из файла"""
         spinner_thread = threading.Thread(target=self.console.show_spinner)
         spinner_thread.start()
         
@@ -330,22 +296,18 @@ class SecureMessagingApp:
             if session_data:
                 self.key_size = session_data['key_size']
                 
-                # Загрузка количества потоков из сессии
                 if 'max_workers' in session_data:
                     self.max_workers = session_data['max_workers']
                     self.parallel_encryptor = ParallelEncryptor(self.console, self.max_workers)
                 
-                # Загрузка приватного ключа
                 self.private_key = serialization.load_pem_private_key(
                     session_data['private_key'].encode('utf-8'),
                     password=None,
                     backend=default_backend()
                 )
                 
-                # Загрузка публичного ключа
                 self.public_key = self.private_key.public_key()
                 
-                # Загрузка публичного ключа собеседника
                 if session_data['other_public_key']:
                     self.other_public_key = serialization.load_pem_public_key(
                         session_data['other_public_key'].encode('utf-8'),
@@ -368,10 +330,8 @@ class SecureMessagingApp:
             return False
     
     def save_session_auto(self):
-        """Автоматическое сохранение сессии после получения ключа собеседника"""
         if self.private_key and self.public_key:
             try:
-                # Экспорт ключей в PEM формат
                 private_key_pem = self.private_key.private_bytes(
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PrivateFormat.PKCS8,
@@ -390,7 +350,6 @@ class SecureMessagingApp:
                         format=serialization.PublicFormat.SubjectPublicKeyInfo
                     ).decode('utf-8')
                 
-                # Экспорт сессии
                 filename = self.session_manager.export_session(
                     private_key_pem, public_key_pem, other_public_key_pem, 
                     self.key_size, self.max_workers
@@ -407,7 +366,6 @@ class SecureMessagingApp:
         """Восстановление сессии из ключей"""
         print("\nВосстановление сессии из ключей:")
         
-        # Запрос приватного ключа
         print("Введите ваш приватный ключ (PEM формат):")
         print("Введите 'END' на новой строке для завершения")
         private_lines = []
@@ -417,7 +375,6 @@ class SecureMessagingApp:
                 break
             private_lines.append(line)
         
-        # Запрос публичного ключа собеседника (опционально)
         print("\nВведите публичный ключ собеседника (если есть):")
         print("Введите 'END' на новой строке для завершения или 'SKIP' для пропуска")
         public_lines = []
@@ -428,7 +385,6 @@ class SecureMessagingApp:
             public_lines.append(line)
         
         try:
-            # Загрузка приватного ключа
             self.private_key = serialization.load_pem_private_key(
                 '\n'.join(private_lines).encode('utf-8'),
                 password=None,
@@ -436,7 +392,6 @@ class SecureMessagingApp:
             )
             self.public_key = self.private_key.public_key()
             
-            # Загрузка публичного ключа собеседника
             if public_lines and public_lines[0].upper() != 'SKIP':
                 self.other_public_key = serialization.load_pem_public_key(
                     '\n'.join(public_lines).encode('utf-8'),
@@ -450,13 +405,11 @@ class SecureMessagingApp:
             print(f"Ошибка восстановления сессии: {e}")
     
     def generate_keys(self):
-        """Генерация новой пары ключей"""
         print(f"\nГенерация ключей RSA-{self.key_size}...")
         
-        # Показать прогресс бар
         for i in range(101):
             self.console.progress_bar(i, 100, prefix='Генерация ключей:', length=40)
-            time.sleep(0.02)  # Имитация работы
+            time.sleep(0.002) 
         
         self.private_key = rsa.generate_private_key(
             public_exponent=65537,
@@ -468,7 +421,6 @@ class SecureMessagingApp:
         print("\nКлючи успешно сгенерированы!")
     
     def show_public_key(self):
-        """Показать публичный ключ"""
         if not self.public_key:
             print("Сначала сгенерируйте ключи!")
             return
@@ -485,7 +437,6 @@ class SecureMessagingApp:
         input("\nНажмите Enter для продолжения...")
     
     def import_public_key(self):
-        """Импорт публичного ключа собеседника"""
         print("Вставьте публичный ключ собеседника ниже:")
         print("Введите 'END' на новой строке для завершения")
         
@@ -503,7 +454,6 @@ class SecureMessagingApp:
             )
             print("Публичный ключ успешно импортирован!")
             
-            # Автоматическое сохранение сессии
             self.save_session_auto()
             
             return True
@@ -512,7 +462,6 @@ class SecureMessagingApp:
             return False
     
     def encrypt_message(self):
-        """Шифрование сообщения"""
         if not self.other_public_key:
             print("Сначала импортируйте публичный ключ собеседника!")
             return
@@ -527,7 +476,6 @@ class SecureMessagingApp:
             print("Шифрование...")
             self.session_key = os.urandom(32)
             
-            # Показать прогресс
             for i in range(101):
                 self.console.progress_bar(i, 100, prefix='Шифрование:', length=40)
                 time.sleep(0.01)
