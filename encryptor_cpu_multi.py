@@ -171,7 +171,6 @@ class ConsoleManager:
     
     @staticmethod
     def print_header():
-        """Вывести заголовок программы"""
         os.system('cls' if os.name == 'nt' else 'clear')
         print("=" * 60)
     
@@ -363,7 +362,6 @@ class SecureMessagingApp:
                 return None
     
     def recover_from_keys(self):
-        """Восстановление сессии из ключей"""
         print("\nВосстановление сессии из ключей:")
         
         print("Введите ваш приватный ключ (PEM формат):")
@@ -515,7 +513,6 @@ class SecureMessagingApp:
             print(f"Ошибка шифрования: {e}")
     
     def decrypt_message(self):
-        """Расшифровка сообщения"""
         if not self.private_key:
             print("Сначала сгенерируйте ключи!")
             return
@@ -534,8 +531,6 @@ class SecureMessagingApp:
         
         try:
             print("Расшифровка...")
-            
-            # Показать прогресс
             for i in range(101):
                 self.console.progress_bar(i, 100, prefix='Расшифровка:', length=40)
                 time.sleep(0.01)
@@ -573,7 +568,6 @@ class SecureMessagingApp:
             print(f"Ошибка расшифровки: {e}")
     
     def encrypt_file(self):
-        """Шифрование файла"""
         if not self.other_public_key:
             print("Сначала импортируйте публичный ключ собеседника!")
             return
@@ -591,10 +585,9 @@ class SecureMessagingApp:
                 file_data = f.read()
             
             file_size = len(file_data)
-            
-            # Спросить о использовании многопоточности для больших файлов
+
             use_multithreading = self.use_multithreading
-            if file_size > 5 * 1024 * 1024:  # > 5MB
+            if file_size > 5 * 1024 * 1024: 
                 print(f"Размер файла: {file_size / (1024*1024):.2f} MB")
                 print(f"Доступно потоков: {self.max_workers}")
                 choice = input("Использовать многопоточное шифрование? (Y/n): ").strip().lower()
@@ -616,7 +609,6 @@ class SecureMessagingApp:
                 print(f"Используется многопоточное шифрование ({self.max_workers} потоков)...")
                 encrypted_data = self.parallel_encryptor.parallel_encrypt(file_data, session_key, iv)
             else:
-                # Обычное однопоточное шифрование
                 print("Используется однопоточное шифрование...")
                 cipher = Cipher(
                     algorithms.AES(session_key),
@@ -625,8 +617,7 @@ class SecureMessagingApp:
                 )
                 encryptor = cipher.encryptor()
                 
-                # Показать прогресс для однопоточного режима
-                chunk_size = 64 * 1024  # 64KB
+                chunk_size = 64 * 1024 
                 encrypted_chunks = []
                 for i in range(0, file_size, chunk_size):
                     chunk = file_data[i:i + chunk_size]
@@ -651,7 +642,6 @@ class SecureMessagingApp:
             print(f"Ошибка шифрования файла: {e}")
     
     def decrypt_file(self):
-        """Расшифровка файла"""
         if not self.private_key:
             print("Сначала сгенерируйте ключи!")
             return
@@ -743,7 +733,6 @@ class SecureMessagingApp:
             except ValueError: print("Введите число!")
     
     def toggle_multithreading(self):
-        """Включение/выключение многопоточности"""
         self.use_multithreading = not self.use_multithreading
         status = "ВКЛЮЧЕНА" if self.use_multithreading else "ВЫКЛЮЧЕНА"
         print(f"\nМногопоточность {status}")
@@ -755,20 +744,17 @@ class SecureMessagingApp:
         print("СТАТУС СЕССИИ:")
         print("=" * 60)
         
-        # Информация о ключах
         key_status = "СГЕНЕРИРОВАНЫ" if self.private_key else "ОТСУТСТВУЮТ"
         print(f"Ваши ключи: {key_status}")    
         if self.private_key: print(f"Размер ключа: {self.key_size} бит")
         other_key_status = "ИМПОРТИРОВАН" if self.other_public_key else "ОТСУТСТВУЕТ"
         print(f"Ключ собеседника: {other_key_status}")
         
-        # Информация о многопоточности
         threading_status = "ВКЛЮЧЕНА" if self.use_multithreading else "ВЫКЛЮЧЕНА"
         print(f"Многопоточность: {threading_status}")
         print(f"Количество потоков: {self.max_workers}")
         print(f"Доступно ядер CPU: {os.cpu_count() or 'N/A'}")
         
-        # Информация о сессиях
         latest_session = self.session_manager.find_latest_session()
         if latest_session:
             session_time = datetime.fromtimestamp(os.path.getmtime(latest_session))
