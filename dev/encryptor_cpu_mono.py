@@ -88,7 +88,6 @@ class SessionManager:
     
     @staticmethod
     def import_session(filename: str) -> Optional[Dict[str, Any]]:
-        """Импорт сессии из JSON файла"""
         try:
             with open(filename, 'r', encoding='utf-8') as f:
                 session_data = json.load(f)
@@ -120,7 +119,6 @@ class SecureMessagingApp:
         self.initialize()
     
     def initialize(self):
-        """Автоматическая инициализация при запуске"""
         self.console.print_header()
         print("Инициализация системы...")
         
@@ -194,7 +192,6 @@ class SecureMessagingApp:
             return False
     
     def save_session_auto(self):
-        """Автоматическое сохранение сессии после получения ключа собеседника"""
         if self.private_key and self.public_key:
             try:
                 private_key_pem = self.private_key.private_bytes(
