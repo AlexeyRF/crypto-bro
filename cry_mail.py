@@ -230,7 +230,7 @@ class EmailUpdaterThread(QThread):
     Режимы работы:
       - 'inbox' : периодическая проверка наличия новых сообщений в Inbox (интервал 30 сек).
                   При переходе в вкладку Inbox запускается немедленная проверка.
-      - 'sent'  : однократная проверка при переходе в вкладку Sent.
+      - 'sent'  : однократная проверка при перех��де в вкладку Sent.
       - 'none'  : проверки не выполняются.
     """
     update_started = Signal()
@@ -286,6 +286,7 @@ class EmailUpdaterThread(QThread):
                         try:
                             # Проверяем IMAP живость и ищем новые сообщения (UNSEEN) — только сетевые операции здесь
                             if self.email_client.is_imap_alive():
+                                call_check_keys = False  # флаг — вызвать checkForKeyRequests после освобождения локa
                                 try:
                                     with self.email_client.imap_lock:
                                         self.email_client.serverIMAP.select('inbox')
@@ -336,19 +337,24 @@ class EmailUpdaterThread(QThread):
                                                                         self.email_client.seen_message_ids.add(num)
                                                                         new_messages.append((sender, subject))
                                                                 except Exception as e:
-                                                                    print(f"Ошибка обработки письма в потоке: {e}")
+                                                                    print(f"Ошиб��а обработки письма в потоке: {e}")
                                                                     continue
                                                 except Exception as e:
                                                     print(f"Ошибка обработки отдельного письма в потоке: {e}")
                                                     continue
 
                                             if new_messages:
-                                                # delegate key requests check (may send key replies)
-                                                try:
-                                                    self.email_client.checkForKeyRequests()
-                                                except Exception as e:
-                                                    print(f"Ошибка при checkForKeyRequests в потоке: {e}")
+                                                # Отмечаем необходимость проверки запросов ключа после выхода из блока imap_lock
+                                                call_check_keys = True
                                 except: pass
+
+                                # ВАЖНО: вызываем checkForKeyRequests() уже ВНЕ блока с захваченным imap_lock,
+                                # чтобы избежать рекурсивного взятия одного и того же неблокирующего lock'а (deadlock).
+                                if call_check_keys:
+                                    try:
+                                        self.email_client.checkForKeyRequests()
+                                    except Exception as e:
+                                        print(f"Ошибка при checkForKeyRequests в потоке: {e}")
                         except (imaplib.IMAP4.abort, imaplib.IMAP4.error, ConnectionError) as e:
                             print(f"IMAP ошибка в потоке, переподключаемся: {e}")
                             try:
@@ -381,8 +387,7 @@ class EmailUpdaterThread(QThread):
     def stop(self):
         self.running = False
         self.wait(2000)
-
-
+        
 class CryptoManager:
     """Менеджер криптографических операций"""
     def __init__(self, keys_dir="keys"):
