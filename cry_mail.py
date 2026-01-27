@@ -15,7 +15,7 @@ import os
 import json
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 import threading
@@ -225,123 +225,163 @@ class PasswordManager:
             return None
 
 class EmailUpdaterThread(QThread):
+    """
+    Фоновый поток, отвечающий за проверки почты.
+    Режимы работы:
+      - 'inbox' : периодическая проверка наличия новых сообщений в Inbox (интервал 30 сек).
+                  При переходе в вкладку Inbox запускается немедленная проверка.
+      - 'sent'  : однократная проверка при переходе в вкладку Sent.
+      - 'none'  : проверки не выполняются.
+    """
     update_started = Signal()
     update_finished = Signal()
-    
+    inbox_checked = Signal()  # emitted when inbox check completed (main thread should refresh inbox)
+    sent_checked = Signal()   # emitted when sent check requested (main thread should refresh sent)
+
     def __init__(self, email_client):
         super().__init__()
         self.email_client = email_client
         self.running = True
-        # Добавляем переменную для отслеживания последнего UID
-        self.last_processed_uid = 0
-        self.last_check_time = datetime.now()
-    
+        self.mode = 'none'
+        self.inbox_interval = 30  # seconds
+        self.last_inbox_check = datetime.min
+        self._immediate_inbox_check = False
+        self._need_sent_check = False
+
+    @Slot(str)
+    def setMode(self, mode: str):
+        """Set current mode: 'inbox', 'sent', 'none'"""
+        self.mode = mode
+        if mode == 'inbox':
+            # force immediate check on switching to inbox
+            self._immediate_inbox_check = True
+        elif mode == 'sent':
+            # request one-shot sent check
+            self._need_sent_check = True
+
+    @Slot()
+    def requestImmediateInboxCheck(self):
+        self._immediate_inbox_check = True
+
+    @Slot()
+    def requestSentCheck(self):
+        self._need_sent_check = True
+
     def run(self):
         while self.running:
             try:
-                self.update_started.emit()
-                try:
-                    if self.email_client.is_imap_alive():
+                now = datetime.now()
+                if self.mode == 'inbox':
+                    should_check = False
+                    if self._immediate_inbox_check:
+                        should_check = True
+                        self._immediate_inbox_check = False
+                    else:
+                        if (now - self.last_inbox_check).total_seconds() >= self.inbox_interval:
+                            should_check = True
+
+                    if should_check:
+                        self.last_inbox_check = now
+                        self.update_started.emit()
                         try:
-                            with self.email_client.imap_lock:
-                                self.email_client.serverIMAP.select('inbox')
-                                
-                                # ОПТИМИЗАЦИЯ: Ищем только НОВЫЕ сообщения с момента последней проверки
-                                # Используем поиск по непрочитанным сообщениям ИЛИ по UID
-                                current_time = datetime.now()
-                                
-                                # Если прошло меньше 5 минут с последней полной проверки, используем UNSEEN
-                                # Для полной проверки раз в 5 минут
-                                if (current_time - self.last_check_time).total_seconds() > 300:
-                                    # Полная проверка раз в 5 минут
-                                    status, messages = self.email_client.serverIMAP.search(None, 'ALL')
-                                    self.last_check_time = current_time
-                                else:
-                                    # Быстрая проверка: только непрочитанные
-                                    status, messages = self.email_client.serverIMAP.search(None, 'UNSEEN')
-                                
-                                if status == 'OK':
-                                    new_messages = []
-                                    message_nums = messages[0].split()
-                                    
-                                    # Ограничиваем количество обрабатываемых сообщений за раз
-                                    max_messages_per_check = 10
-                                    for num in message_nums[:max_messages_per_check]:
-                                        try:
-                                            status, message = self.email_client.serverIMAP.fetch(num, '(RFC822 UID)')
-                                            if status != 'OK':
-                                                continue
-                                            
-                                            # Получаем UID сообщения
-                                            uid = None
-                                            for part in message:
-                                                if isinstance(part, tuple) and len(part) > 0:
-                                                    # Ищем UID в ответе
-                                                    for item in part:
-                                                        if isinstance(item, bytes):
-                                                            if b'UID' in item:
+                            # Проверяем IMAP живость и ищем новые сообщения (UNSEEN) — только сетевые операции здесь
+                            if self.email_client.is_imap_alive():
+                                try:
+                                    with self.email_client.imap_lock:
+                                        self.email_client.serverIMAP.select('inbox')
+                                        status, messages = self.email_client.serverIMAP.search(None, 'UNSEEN')
+                                        if status == 'OK' and messages and messages[0]:
+                                            message_nums = messages[0].split()
+                                            max_messages_per_check = 10
+                                            new_messages = []
+                                            for num in message_nums[:max_messages_per_check]:
+                                                try:
+                                                    status, message = self.email_client.serverIMAP.fetch(num, '(RFC822 UID)')
+                                                    if status != 'OK':
+                                                        continue
+
+                                                    uid = None
+                                                    for part in message:
+                                                        if isinstance(part, tuple) and len(part) > 0:
+                                                            for item in part:
+                                                                if isinstance(item, bytes) and b'UID' in item:
+                                                                    try:
+                                                                        uid_match = re.search(rb'UID\s+(\d+)', item)
+                                                                        if uid_match:
+                                                                            uid = int(uid_match.group(1))
+                                                                    except:
+                                                                        pass
+
+                                                    if uid and uid <= getattr(self.email_client.updater_thread, 'last_processed_uid', 0):
+                                                        continue
+
+                                                    if uid:
+                                                        # store last processed uid in thread to avoid races
+                                                        if hasattr(self.email_client.updater_thread, 'last_processed_uid'):
+                                                            self.email_client.updater_thread.last_processed_uid = max(getattr(self.email_client.updater_thread, 'last_processed_uid', 0), uid)
+                                                        else:
+                                                            self.email_client.updater_thread.last_processed_uid = uid
+
+                                                    for part in message:
+                                                        if isinstance(part, tuple) and len(part) == 2:
+                                                            email_data = part[1]
+                                                            if email_data:
                                                                 try:
-                                                                    uid_match = re.search(rb'UID\s+(\d+)', item)
-                                                                    if uid_match:
-                                                                        uid = int(uid_match.group(1))
-                                                                except:
-                                                                    pass
-                                            
-                                            # Пропускаем если уже обрабатывали
-                                            if uid and uid <= self.last_processed_uid:
-                                                continue
-                                            
-                                            if uid:
-                                                self.last_processed_uid = max(self.last_processed_uid, uid)
-                                            
-                                            # Извлекаем данные письма
-                                            for part in message:
-                                                if isinstance(part, tuple) and len(part) == 2:
-                                                    email_data = part[1]
-                                                    if email_data:
-                                                        try:
-                                                            emailMessage = email.message_from_bytes(email_data)
-                                                            sender = email.utils.parseaddr(emailMessage['From'])[1]
-                                                            subject = emailMessage['Subject']
-                                                            subject = self.email_client.decodeUTF8(subject)
-                                                            
-                                                            # Проверяем, не видели ли мы это сообщение раньше
-                                                            if num not in self.email_client.seen_message_ids:
-                                                                self.email_client.seen_message_ids.add(num)
-                                                                new_messages.append((sender, subject))
-                                                        except Exception as e:
-                                                            print(f"Ошибка обработки письма: {e}")
-                                                            continue
-                                        
-                                        except Exception as e:
-                                            print(f"Ошибка обработки отдельного письма: {e}")
-                                            continue
-                                    
-                                    # Проверяем запросы ключей только если есть новые сообщения
-                                    if new_messages:
-                                        self.email_client.checkForKeyRequests()
-                                
+                                                                    emailMessage = email.message_from_bytes(email_data)
+                                                                    sender = email.utils.parseaddr(emailMessage['From'])[1]
+                                                                    subject = emailMessage['Subject']
+                                                                    subject = self.email_client.decodeUTF8(subject)
+
+                                                                    if num not in self.email_client.seen_message_ids:
+                                                                        self.email_client.seen_message_ids.add(num)
+                                                                        new_messages.append((sender, subject))
+                                                                except Exception as e:
+                                                                    print(f"Ошибка обработки письма в потоке: {e}")
+                                                                    continue
+                                                except Exception as e:
+                                                    print(f"Ошибка обработки отдельного письма в потоке: {e}")
+                                                    continue
+
+                                            if new_messages:
+                                                # delegate key requests check (may send key replies)
+                                                try:
+                                                    self.email_client.checkForKeyRequests()
+                                                except Exception as e:
+                                                    print(f"Ошибка при checkForKeyRequests в потоке: {e}")
+                                except: pass
                         except (imaplib.IMAP4.abort, imaplib.IMAP4.error, ConnectionError) as e:
                             print(f"IMAP ошибка в потоке, переподключаемся: {e}")
-                            self.email_client.reconnect_imap()
-                    else:
-                        self.email_client.reconnect_imap()
-                except Exception as e:
-                    print(f"Общая ошибка в потоке обновления: {e}")
-                
-                self.update_finished.emit()
-                
+                            try:
+                                self.email_client.reconnect_imap()
+                            except Exception as e2:
+                                print(f"Ошибка переподключения IMAP из потока: {e2}")
+                        except Exception as e:
+                            print(f"Общая ошибка при проверке inbox в потоке: {e}")
+                        # notify main thread to refresh UI inbox list
+                        self.inbox_checked.emit()
+                        self.update_finished.emit()
+
+                elif self.mode == 'sent' and self._need_sent_check:
+                    # One-shot: notify main thread to refresh Sent folder
+                    self._need_sent_check = False
+                    self.update_started.emit()
+                    # (Don't perform heavy UI updates in thread; main thread will refreshSentList)
+                    self.sent_checked.emit()
+                    self.update_finished.emit()
+
             except Exception as e:
                 print(f"Критическая ошибка в потоке обновления: {e}")
-            
-            # Ждем 10 секунд вместо 30 для более быстрого отклика
-            for _ in range(10):
+
+            # Sleep a short time to remain responsive to mode changes/requests.
+            for _ in range(5):
                 if not self.running:
                     break
-                time.sleep(1)
-    
+                self.msleep(200)
+
     def stop(self):
         self.running = False
+        self.wait(2000)
+
 
 class CryptoManager:
     """Менеджер криптографических операций"""
@@ -984,7 +1024,7 @@ class LoginWindow(QDialog):
                 QMessageBox.warning(self, "Ошибка", "Неверный мастер-пароль или повреждены данные")
     
     def fillServerPreset(self, index):
-        """Заполняет поля серверов из предустановки"""
+        """Заполняет поля серверов из предустанвки"""
         data = self.serverPresetCombo.itemData(index)
         if data and data[0]:
             smtp_server, smtp_port, imap_server, imap_port = data
@@ -1112,14 +1152,27 @@ class EmailClient(QWidget):
             self.crypto = None
         
         self.initConnections()
-        self.actualMessagesNum = self.getInitMessageNum()
         self.createUI()
         
+        # Создаем и настраиваем фоновый поток — он будет управляться переключением вкладок
         self.updater_thread = EmailUpdaterThread(self)
         self.updater_thread.update_started.connect(self.onUpdateStarted)
-        self.updater_thread.update_finished.connect(self.onUpdateFinished)
+        # Подключаем сигналы конкретных завершений к обновлению соответствующих вкладок в GUI
+        self.updater_thread.inbox_checked.connect(self.on_inbox_checked)
+        self.updater_thread.sent_checked.connect(self.on_sent_checked)
         self.updater_thread.start()
         
+        # Устанавливаем начальный режим в соответствии с текущей вкладкой
+        current_index = self.tabs.currentIndex() if hasattr(self, 'tabs') else 0
+        # 0 = Inbox, 1 = Sent, 2 = New Mail, 3 = Decrypt
+        if current_index == 0:
+            self.updater_thread.setMode('inbox')
+        elif current_index == 1:
+            self.updater_thread.setMode('sent')
+        else:
+            self.updater_thread.setMode('none')
+        
+        # Таймер для проверки соединений (оставляем как есть)
         self.connection_timer = QTimer()
         self.connection_timer.timeout.connect(self.check_connections)
         self.connection_timer.start(60000)
@@ -1145,9 +1198,18 @@ class EmailClient(QWidget):
     
     def quitApplication(self):
         """Выход из приложения"""
-        self.updater_thread.stop()
-        self.updater_thread.wait()
-        self.tray_icon.hide()
+        try:
+            self.updater_thread.stop()
+        except Exception:
+            pass
+        try:
+            self.updater_thread.wait(2000)
+        except Exception:
+            pass
+        try:
+            self.tray_icon.hide()
+        except Exception:
+            pass
         QApplication.quit()
     
     def closeEvent(self, event):
@@ -1205,6 +1267,7 @@ class EmailClient(QWidget):
     def createUI(self):
         """Создание пользовательского интерфейса"""
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self.on_tab_changed)
         
         self.inboxTab = QWidget()
         self.inboxLayout = QVBoxLayout()
@@ -1451,10 +1514,25 @@ class EmailClient(QWidget):
     
     @Slot()
     def onUpdateFinished(self):
-        """Окончание обновления"""
-        self.refreshInboxList()
-        self.refreshSentList()
-    
+        """Окончание обновления (не используется напрямую теперь)"""
+        pass
+
+    @Slot()
+    def on_inbox_checked(self):
+        """Slot called when updater thread finished inbox check — refresh inbox in GUI thread"""
+        try:
+            self.refreshInboxList()
+        except Exception as e:
+            print(f"Ошибка при обновлении списка входящих из GUI: {e}")
+
+    @Slot()
+    def on_sent_checked(self):
+        """Slot called when updater thread requested sent refresh — refresh sent in GUI thread"""
+        try:
+            self.refreshSentList()
+        except Exception as e:
+            print(f"Ошибка при обновлении списка отправленных из GUI: {e}")
+
     def checkForKeyRequests(self):
         """Проверка запросов на публичный ключ"""
         if not self.crypto_enabled:
@@ -1534,7 +1612,15 @@ class EmailClient(QWidget):
                         return
                 
                 self.sentList.clear()
-                self.serverIMAP.select('Sent')
+                # try common sent folders
+                try:
+                    self.serverIMAP.select('Sent')
+                except:
+                    # fallback to 'Sent Items' or other names
+                    try:
+                        self.serverIMAP.select('Sent Items')
+                    except:
+                        pass
                 
                 # ОПТИМИЗАЦИЯ: Ограничиваем количество загружаемых сообщений
                 status, messages = self.serverIMAP.search(None, 'ALL')
@@ -2067,6 +2153,31 @@ class EmailClient(QWidget):
             for text, charset in email.header.decode_header(subject)
         )
         return decoded
+
+    @Slot(int)
+    def on_tab_changed(self, index: int):
+        """
+        Управление режимом фонового потока в зависимости от активной вкладки:
+         - При переключении на Inbox (index 0) — немедленная проверка и затем периодическая каждые 30 секунд.
+         - При переключении на Sent (index 1) — однократная проверка.
+         - При переключении на другие вкладки — отключаем проверки.
+        """
+        try:
+            if index == 0:
+                # Inbox
+                if hasattr(self, 'updater_thread'):
+                    self.updater_thread.setMode('inbox')
+                    self.updater_thread.requestImmediateInboxCheck()
+            elif index == 1:
+                # Sent
+                if hasattr(self, 'updater_thread'):
+                    self.updater_thread.setMode('sent')
+                    self.updater_thread.requestSentCheck()
+            else:
+                if hasattr(self, 'updater_thread'):
+                    self.updater_thread.setMode('none')
+        except Exception as e:
+            print(f"Ошибка при изменении вкладки: {e}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
